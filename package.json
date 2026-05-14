@@ -1,7 +1,8 @@
+
 {
-  "name": "api-tong-hop-11-game",
-  "version": "3.0.0",
-  "description": "API tổng hợp dự đoán Tài Xỉu - 11 game",
+  "name": "api-vip-11-game",
+  "version": "7.0.0",
+  "description": "API VIP - 11 Game Tài Xỉu + Sicbo với 12 thuật toán",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
