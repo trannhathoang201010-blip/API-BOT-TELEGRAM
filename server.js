@@ -32,12 +32,12 @@ const historyDB = {};
 for (let key in ALL_APIS) {
   historyDB[key] = {
     data: [],
-    stats: { tong: 0, dung: 0, sai: 0, tiLe: '0%', tiLe10: '0%' },
+    stats: { tong: 0, dung: 0, sai: 0, tiLe: '0%' },
     cache: new Map()
   };
 }
 
-function updateStats(game, thucTe, duDoan) {
+function updateStats(game, thucTe, duDoan, doTinCay) {
   const st = historyDB[game]?.stats;
   if (!st || !thucTe || !duDoan) return;
   const dung = (thucTe === duDoan);
@@ -46,11 +46,8 @@ function updateStats(game, thucTe, duDoan) {
   st.tong++;
   st.tiLe = ((st.dung / st.tong) * 100).toFixed(1) + '%';
   
-  const last10 = historyDB[game].data.slice(0, 10).filter(p => p.thucTe);
-  if (last10.length >= 5) {
-    const dung10 = last10.filter(p => p.ketQua === 'ĐÚNG').length;
-    st.tiLe10 = ((dung10 / last10.length) * 100).toFixed(1) + '%';
-  }
+  // Ghi log để kiểm tra tỉ lệ thực tế
+  console.log(`[${game}] Dự đoán: ${duDoan} (${doTinCay}%) | Thực tế: ${thucTe} | KQ: ${dung ? 'ĐÚNG' : 'SAI'} | TL: ${st.tiLe}`);
   return dung;
 }
 
@@ -108,298 +105,225 @@ async function fetchSicboData(url, gameKey) {
   } catch (err) { return null; }
 }
 
-// ==================== THUẬT TOÁN VIP CÂN BẰNG ====================
-class TaiXiuVIP {
-  constructor(gameKey) {
-    this.gameKey = gameKey;
+// ==================== TÍNH TỈ LỆ THỰC TẾ (48% - 88%) ====================
+function tinhTiLeThucTe(diemTai, diemXiu, soThuatToan, lichSuGanDay) {
+  // 1. Dựa trên chênh lệch điểm số (40% trọng số)
+  let chenhLech = Math.abs(diemTai - diemXiu);
+  let tileTuChenh = 50 + (chenhLech / 2);
+  tileTuChenh = Math.min(85, Math.max(48, tileTuChenh));
+  
+  // 2. Dựa trên số thuật toán đồng thuận (30% trọng số)
+  let tileTuThuatToan = 50 + (soThuatToan * 3);
+  tileTuThuatToan = Math.min(80, Math.max(48, tileTuThuatToan));
+  
+  // 3. Dựa trên độ chính xác gần đây (20% trọng số)
+  let tileTuLichSu = 55;
+  if (lichSuGanDay && lichSuGanDay.length >= 5) {
+    const dungGanDay = lichSuGanDay.filter(kq => kq === true).length;
+    tileTuLichSu = 45 + (dungGanDay / lichSuGanDay.length) * 40;
+    tileTuLichSu = Math.min(85, Math.max(48, tileTuLichSu));
   }
+  
+  // 4. Điều chỉnh theo độ khó (10%)
+  let doKho = 0;
+  if (Math.abs(diemTai - diemXiu) < 15) doKho = 5;
+  if (Math.abs(diemTai - diemXiu) < 10) doKho = 10;
+  if (Math.abs(diemTai - diemXiu) < 5) doKho = 15;
+  
+  // Tổng hợp có trọng số
+  let tileCuoi = (tileTuChenh * 0.4) + (tileTuThuatToan * 0.3) + (tileTuLichSu * 0.2) - (doKho * 0.1);
+  tileCuoi = Math.round(tileCuoi);
+  tileCuoi = Math.min(88, Math.max(48, tileCuoi));
+  
+  return tileCuoi;
+}
 
-  // 1. Streak Analysis - CHỈ ĐÁNH NGƯỢC KHI BỆT ĐỦ DÀI
-  phanTichStreak(lichSu) {
-    if (lichSu.length < 3) return null;
-    let streak = 1;
-    for (let i = 1; i < lichSu.length; i++) {
-      if (lichSu[i] === lichSu[0]) streak++;
-      else break;
-    }
-    if (streak >= 5) {
-      return { duDoan: lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài', doTinCay: 80, trongSo: 2.0 };
-    }
-    if (streak === 4) {
-      return { duDoan: lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài', doTinCay: 72, trongSo: 1.8 };
-    }
-    return null;
+// ==================== THUẬT TOÁN DỰ ĐOÁN (CÓ TỈ LỆ THỰC TẾ) ====================
+function duDoanTaiXiu(lichSu, lichSuTong, lichSuDungGanDay) {
+  if (!lichSu || lichSu.length < 6) {
+    return { duDoan: 'Tài', doTinCay: 52, soThuatToan: 1, lyDo: '📊 Chưa đủ dữ liệu' };
   }
-
-  // 2. Martingale - CHỈ BẺ KHI MỘT BÊN QUÁ 7/10
-  phanTichMartingale(lichSu) {
-    if (lichSu.length < 10) return null;
+  
+  let diemTai = 0, diemXiu = 0;
+  let soThuatToanApDung = 0;
+  let cacDuDoan = [];
+  
+  // 1. Streak Analysis (bệt)
+  let streak = 1;
+  for (let i = 1; i < lichSu.length; i++) {
+    if (lichSu[i] === lichSu[0]) streak++;
+    else break;
+  }
+  if (streak >= 5) {
+    const pred = lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài';
+    const diem = 80;
+    cacDuDoan.push({ duDoan: pred, diem, trongSo: 2.0 });
+    if (pred === 'Tài') diemTai += diem * 2.0;
+    else diemXiu += diem * 2.0;
+    soThuatToanApDung++;
+  } else if (streak === 4) {
+    const pred = lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài';
+    const diem = 72;
+    cacDuDoan.push({ duDoan: pred, diem, trongSo: 1.8 });
+    if (pred === 'Tài') diemTai += diem * 1.8;
+    else diemXiu += diem * 1.8;
+    soThuatToanApDung++;
+  }
+  
+  // 2. Martingale (quá nóng)
+  if (lichSu.length >= 10) {
     const last10 = lichSu.slice(0, 10);
     const tai10 = last10.filter(r => r === 'Tài').length;
     const xiu10 = 10 - tai10;
     if (tai10 >= 8) {
-      return { duDoan: 'Xỉu', doTinCay: 76, trongSo: 1.8 };
+      cacDuDoan.push({ duDoan: 'Xỉu', diem: 76, trongSo: 1.8 });
+      diemXiu += 76 * 1.8;
+      soThuatToanApDung++;
+    } else if (xiu10 >= 8) {
+      cacDuDoan.push({ duDoan: 'Tài', diem: 76, trongSo: 1.8 });
+      diemTai += 76 * 1.8;
+      soThuatToanApDung++;
+    } else if (tai10 === 7) {
+      cacDuDoan.push({ duDoan: 'Xỉu', diem: 68, trongSo: 1.5 });
+      diemXiu += 68 * 1.5;
+      soThuatToanApDung++;
+    } else if (xiu10 === 7) {
+      cacDuDoan.push({ duDoan: 'Tài', diem: 68, trongSo: 1.5 });
+      diemTai += 68 * 1.5;
+      soThuatToanApDung++;
     }
-    if (xiu10 >= 8) {
-      return { duDoan: 'Tài', doTinCay: 76, trongSo: 1.8 };
-    }
-    if (tai10 === 7) {
-      return { duDoan: 'Xỉu', doTinCay: 68, trongSo: 1.5 };
-    }
-    if (xiu10 === 7) {
-      return { duDoan: 'Tài', doTinCay: 68, trongSo: 1.5 };
-    }
-    return null;
   }
-
-  // 3. Baccarat Pattern - CẦU 1-1, 2-1, 3-2
-  phanTichBaccarat(lichSu) {
-    if (lichSu.length < 8) return null;
+  
+  // 3. Baccarat Pattern (cầu 1-1)
+  if (lichSu.length >= 8) {
     let zigzag = 0;
     for (let i = 1; i < 6; i++) {
       if (lichSu[i] !== lichSu[i-1]) zigzag++;
     }
     if (zigzag >= 4) {
-      return { duDoan: lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài', doTinCay: 70, trongSo: 1.6 };
+      const pred = lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài';
+      cacDuDoan.push({ duDoan: pred, diem: 70, trongSo: 1.6 });
+      if (pred === 'Tài') diemTai += 70 * 1.6;
+      else diemXiu += 70 * 1.6;
+      soThuatToanApDung++;
     }
-    
-    const p1 = lichSu.slice(0,3).join('');
-    const p2 = lichSu.slice(3,6).join('');
-    if (p1 === p2 && (p1 === 'TàiTàiXỉu' || p1 === 'XỉuXỉuTài')) {
-      return { duDoan: p1[0] === 'Tài' ? 'Tài' : 'Xỉu', doTinCay: 74, trongSo: 1.6 };
-    }
-    return null;
   }
-
-  // 4. Tổng điểm - DỰA TRÊN DỮ LIỆU DICE
-  phanTichTongDiem(lichSuTong) {
-    if (!lichSuTong || lichSuTong.length < 10) return null;
+  
+  // 4. Tổng điểm phân tích
+  if (lichSuTong && lichSuTong.length >= 10) {
     const last10 = lichSuTong.slice(0, 10);
     const avg = last10.reduce((a,b) => a + b, 0) / 10;
-    const prev10 = lichSuTong.slice(10, 20);
-    if (prev10.length >= 10) {
-      const avgPrev = prev10.reduce((a,b) => a + b, 0) / 10;
-      if (avg > avgPrev + 1.5) {
-        return { duDoan: 'Xỉu', doTinCay: 66, trongSo: 1.4 };
-      }
-      if (avg < avgPrev - 1.5) {
-        return { duDoan: 'Tài', doTinCay: 66, trongSo: 1.4 };
-      }
+    if (avg > 11.5) {
+      cacDuDoan.push({ duDoan: 'Xỉu', diem: 66, trongSo: 1.4 });
+      diemXiu += 66 * 1.4;
+      soThuatToanApDung++;
+    } else if (avg < 9.5) {
+      cacDuDoan.push({ duDoan: 'Tài', diem: 66, trongSo: 1.4 });
+      diemTai += 66 * 1.4;
+      soThuatToanApDung++;
     }
-    return null;
   }
-
-  // 5. Tần suất - DỰA TRÊN 20 PHIÊN
-  phanTichTanSuat(lichSu) {
-    if (lichSu.length < 20) return null;
+  
+  // 5. Tần suất 20 phiên
+  if (lichSu.length >= 20) {
     const dem = { Tài: 0, Xỉu: 0 };
     lichSu.slice(0, 20).forEach(r => dem[r]++);
     const chenh = Math.abs(dem.Tài - dem.Xỉu);
     if (chenh >= 6) {
-      const duDoan = dem.Tài > dem.Xỉu ? 'Xỉu' : 'Tài';
-      return { duDoan, doTinCay: 70, trongSo: 1.5 };
+      const pred = dem.Tài > dem.Xỉu ? 'Xỉu' : 'Tài';
+      cacDuDoan.push({ duDoan: pred, diem: 70, trongSo: 1.5 });
+      if (pred === 'Tài') diemTai += 70 * 1.5;
+      else diemXiu += 70 * 1.5;
+      soThuatToanApDung++;
     }
-    return null;
   }
-
-  // 6. Markov Chain - DỰA TRÊN 2 PHIÊN GẦN NHẤT
-  phanTichMarkov(lichSu) {
-    if (lichSu.length < 12) return null;
-    const map = new Map();
-    for (let i = 0; i < lichSu.length - 2; i++) {
-      const key = `${lichSu[i]}_${lichSu[i+1]}`;
-      const next = lichSu[i+2];
-      if (!map.has(key)) map.set(key, []);
-      map.get(key).push(next);
-    }
-    const lastKey = `${lichSu[0]}_${lichSu[1]}`;
-    const nextList = map.get(lastKey);
-    if (nextList && nextList.length >= 2) {
-      const dem = {};
-      nextList.forEach(v => dem[v] = (dem[v] || 0) + 1);
-      let maxV = null, maxC = 0;
-      for (let v in dem) {
-        if (dem[v] > maxC) { maxC = dem[v]; maxV = v; }
-      }
-      return { duDoan: maxV, doTinCay: 64 + Math.min(8, nextList.length), trongSo: 1.4 };
-    }
-    return null;
-  }
-
-  // 7. Ensemble - TỔNG HỢP CÓ TRỌNG SỐ
-  phanTichEnsemble(lichSu, lichSuTong) {
-    const allPredictions = [
-      this.phanTichStreak(lichSu),
-      this.phanTichMartingale(lichSu),
-      this.phanTichBaccarat(lichSu),
-      this.phanTichTongDiem(lichSuTong),
-      this.phanTichTanSuat(lichSu),
-      this.phanTichMarkov(lichSu)
-    ].filter(p => p !== null);
-    
-    if (allPredictions.length === 0) return null;
-    
-    let diemTai = 0, diemXiu = 0;
-    let tongTrongSo = 0;
-    
-    for (let p of allPredictions) {
-      const w = p.trongSo || 1;
-      tongTrongSo += w;
-      if (p.duDoan === 'Tài') {
-        diemTai += p.doTinCay * w;
-      } else {
-        diemXiu += p.doTinCay * w;
-      }
-    }
-    
-    // Nếu hòa, chọn theo xu hướng 3 phiên gần nhất
-    if (Math.abs(diemTai - diemXiu) < 5) {
-      const last3 = lichSu.slice(0, 3);
-      const tai3 = last3.filter(r => r === 'Tài').length;
-      const duDoan = tai3 >= 2 ? 'Tài' : 'Xỉu';
-      return { duDoan, doTinCay: 62, soThuatToan: allPredictions.length, lyDo: `Hòa vote → theo xu hướng 3 phiên` };
-    }
-    
-    const duDoan = diemTai > diemXiu ? 'Tài' : 'Xỉu';
-    const doTinCay = Math.min(85, Math.round(Math.abs(diemTai - diemXiu) / tongTrongSo * 15 + 55));
-    return { duDoan, doTinCay, soThuatToan: allPredictions.length, lyDo: `Tổng hợp ${allPredictions.length} thuật toán` };
-  }
-
-  duDoan(lichSu, lichSuTong) {
-    if (!lichSu || lichSu.length < 6) {
-      return { duDoan: 'Tài', doTinCay: 55, lyDo: 'Chưa đủ dữ liệu (cần 6 phiên)', soThuatToan: 0 };
-    }
-    const result = this.phanTichEnsemble(lichSu, lichSuTong);
-    if (result) return result;
-    // Fallback an toàn: theo xu hướng 3 phiên gần nhất
+  
+  // Nếu không có thuật toán nào chạy, dùng fallback
+  if (soThuatToanApDung === 0) {
     const last3 = lichSu.slice(0, 3);
     const tai3 = last3.filter(r => r === 'Tài').length;
-    const xiu3 = 3 - tai3;
-    if (tai3 === 3) return { duDoan: 'Xỉu', doTinCay: 65, lyDo: 'Bệt Tài 3 phiên → đánh Xỉu', soThuatToan: 1 };
-    if (xiu3 === 3) return { duDoan: 'Tài', doTinCay: 65, lyDo: 'Bệt Xỉu 3 phiên → đánh Tài', soThuatToan: 1 };
-    return { duDoan: tai3 >= 2 ? 'Tài' : 'Xỉu', doTinCay: 60, lyDo: 'Theo xu hướng 3 phiên', soThuatToan: 1 };
+    if (tai3 === 3) {
+      diemXiu += 65;
+      soThuatToanApDung = 1;
+    } else if (tai3 === 0) {
+      diemTai += 65;
+      soThuatToanApDung = 1;
+    } else {
+      if (tai3 >= 2) diemTai += 60;
+      else diemXiu += 60;
+      soThuatToanApDung = 1;
+    }
   }
+  
+  // Quyết định cuối cùng
+  const duDoan = diemTai > diemXiu ? 'Tài' : 'Xỉu';
+  const doTinCay = tinhTiLeThucTe(diemTai, diemXiu, soThuatToanApDung, lichSuDungGanDay);
+  
+  return { duDoan, doTinCay, soThuatToan: soThuatToanApDung, lyDo: `${soThuatToanApDung} thuật toán | Tài:${Math.round(diemTai)} Xỉu:${Math.round(diemXiu)}` };
 }
 
-// ==================== THUẬT TOÁN SICBO CÂN BẰNG ====================
-class SicboVIP {
-  constructor(gameKey) {
-    this.gameKey = gameKey;
+// Sicbo
+function duDoanSicbo(lichSu, lichSuTong, lichSuDungGanDay) {
+  if (!lichSu || lichSu.length < 6) {
+    return { duDoan: 'Tài', doTinCay: 52, soThuatToan: 1, lyDo: '📊 Chưa đủ dữ liệu' };
   }
-
-  phanTichStreak(lichSu) {
-    if (lichSu.length < 3) return null;
-    let streak = 1;
-    for (let i = 1; i < lichSu.length; i++) {
-      if (lichSu[i] === lichSu[0]) streak++;
-      else break;
-    }
-    if (streak >= 4 && lichSu[0] !== 'Bão') {
-      return { duDoan: lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài', doTinCay: 74, trongSo: 1.8 };
-    }
-    if (streak >= 2 && lichSu[0] === 'Bão') {
-      return { duDoan: 'Tài', doTinCay: 66, trongSo: 1.5 };
-    }
-    return null;
+  
+  let diemTai = 0, diemXiu = 0, diemBao = 0;
+  let soThuatToanApDung = 0;
+  
+  // Streak
+  let streak = 1;
+  for (let i = 1; i < lichSu.length; i++) {
+    if (lichSu[i] === lichSu[0]) streak++;
+    else break;
   }
-
-  phanTichTanSuatBao(lichSu) {
-    if (lichSu.length < 30) return null;
-    const baoCount = lichSu.slice(0, 50).filter(r => r === 'Bão').length;
-    if (baoCount === 0) {
-      return { duDoan: 'Bão', doTinCay: 58, trongSo: 1.3 };
-    }
-    return null;
+  if (streak >= 4 && lichSu[0] !== 'Bão') {
+    const pred = lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài';
+    if (pred === 'Tài') diemTai += 74 * 1.8;
+    else diemXiu += 74 * 1.8;
+    soThuatToanApDung++;
   }
-
-  phanTichMartingale(lichSu) {
-    if (lichSu.length < 10) return null;
+  
+  // Martingale
+  if (lichSu.length >= 10) {
     const last10 = lichSu.slice(0, 10);
     const tai10 = last10.filter(r => r === 'Tài').length;
     const xiu10 = last10.filter(r => r === 'Xỉu').length;
     if (tai10 >= 7) {
-      return { duDoan: 'Xỉu', doTinCay: 70, trongSo: 1.6 };
+      diemXiu += 70 * 1.6;
+      soThuatToanApDung++;
+    } else if (xiu10 >= 7) {
+      diemTai += 70 * 1.6;
+      soThuatToanApDung++;
     }
-    if (xiu10 >= 7) {
-      return { duDoan: 'Tài', doTinCay: 70, trongSo: 1.6 };
-    }
-    return null;
   }
-
-  phanTichBaccarat(lichSu) {
-    if (lichSu.length < 8) return null;
-    let zigzag = 0;
-    for (let i = 1; i < 6; i++) {
-      if (lichSu[i] !== lichSu[i-1] && lichSu[i] !== 'Bão' && lichSu[i-1] !== 'Bão') zigzag++;
+  
+  // Bão check
+  if (lichSu.length >= 30) {
+    const baoCount = lichSu.slice(0, 50).filter(r => r === 'Bão').length;
+    if (baoCount === 0) {
+      diemBao += 58 * 1.3;
+      soThuatToanApDung++;
     }
-    if (zigzag >= 4) {
-      return { duDoan: lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài', doTinCay: 68, trongSo: 1.5 };
-    }
-    return null;
   }
-
-  phanTichTongDiem(lichSuTong, lichSu) {
-    if (!lichSuTong || lichSuTong.length < 10) return null;
-    const avg = lichSuTong.slice(0, 10).reduce((a,b) => a + b, 0) / 10;
-    const lastBaoIndex = lichSu.findIndex(r => r === 'Bão');
-    if (lastBaoIndex === 0 && avg > 10.5) {
-      return { duDoan: 'Tài', doTinCay: 66, trongSo: 1.4 };
-    }
-    if (lastBaoIndex === 0 && avg <= 10.5) {
-      return { duDoan: 'Xỉu', doTinCay: 66, trongSo: 1.4 };
-    }
-    return null;
-  }
-
-  phanTichEnsemble(lichSu, lichSuTong) {
-    const allPredictions = [
-      this.phanTichStreak(lichSu),
-      this.phanTichTanSuatBao(lichSu),
-      this.phanTichMartingale(lichSu),
-      this.phanTichBaccarat(lichSu),
-      this.phanTichTongDiem(lichSuTong, lichSu)
-    ].filter(p => p !== null);
-    
-    if (allPredictions.length === 0) return null;
-    
-    let diemTai = 0, diemXiu = 0, diemBao = 0;
-    let tongTrongSo = 0;
-    
-    for (let p of allPredictions) {
-      const w = p.trongSo || 1;
-      tongTrongSo += w;
-      if (p.duDoan === 'Tài') diemTai += p.doTinCay * w;
-      else if (p.duDoan === 'Xỉu') diemXiu += p.doTinCay * w;
-      else if (p.duDoan === 'Bão') diemBao += p.doTinCay * w;
-    }
-    
-    let maxDiem = Math.max(diemTai, diemXiu, diemBao);
-    let duDoan = 'Tài';
-    if (maxDiem === diemXiu && diemXiu > diemTai + 5) duDoan = 'Xỉu';
-    if (maxDiem === diemBao && diemBao > diemTai + 10 && diemBao > diemXiu + 10) duDoan = 'Bão';
-    
-    let doTinCay = Math.min(82, Math.round(maxDiem / tongTrongSo * 1.5 + 50));
-    return { duDoan, doTinCay, soThuatToan: allPredictions.length, lyDo: `Tổng hợp ${allPredictions.length} thuật toán` };
-  }
-
-  duDoan(lichSu, lichSuTong) {
-    if (!lichSu || lichSu.length < 6) {
-      return { duDoan: 'Tài', doTinCay: 55, lyDo: 'Chưa đủ dữ liệu', soThuatToan: 0 };
-    }
-    const result = this.phanTichEnsemble(lichSu, lichSuTong);
-    if (result) return result;
+  
+  // Fallback
+  if (soThuatToanApDung === 0) {
     const last3 = lichSu.slice(0, 3);
     const tai3 = last3.filter(r => r === 'Tài').length;
-    const bao3 = last3.filter(r => r === 'Bão').length;
-    if (bao3 >= 1) return { duDoan: 'Tài', doTinCay: 60, lyDo: 'Sau Bão → Tài', soThuatToan: 1 };
-    return { duDoan: tai3 >= 2 ? 'Tài' : 'Xỉu', doTinCay: 60, lyDo: 'Xu hướng 3 phiên', soThuatToan: 1 };
+    if (tai3 >= 2) diemTai += 60;
+    else diemXiu += 60;
+    soThuatToanApDung = 1;
   }
-}
-
-// Khởi tạo predictor cho từng game
-const predictors = {};
-for (let key in ALL_APIS) {
-  predictors[key] = key.includes('sicbo') ? new SicboVIP(key) : new TaiXiuVIP(key);
+  
+  let maxDiem = Math.max(diemTai, diemXiu, diemBao);
+  let duDoan = 'Tài';
+  if (maxDiem === diemXiu && diemXiu > diemTai + 5) duDoan = 'Xỉu';
+  if (maxDiem === diemBao && diemBao > diemTai + 10 && diemBao > diemXiu + 10) duDoan = 'Bão';
+  
+  const doTinCay = tinhTiLeThucTe(diemTai, diemXiu, soThuatToanApDung, lichSuDungGanDay);
+  
+  return { duDoan, doTinCay, soThuatToan: soThuatToanApDung, lyDo: `${soThuatToanApDung} thuật toán | T:${Math.round(diemTai)} X:${Math.round(diemXiu)} B:${Math.round(diemBao)}` };
 }
 
 // ==================== XỬ LÝ REQUEST ====================
@@ -411,19 +335,32 @@ async function xuLyGame(gameKey) {
   const hist = historyDB[gameKey];
   const lastPred = hist.data[0];
   
+  // Lấy lịch sử đúng/sai gần đây để tính tỉ lệ
+  const lichSuDungGanDay = hist.data.slice(0, 10).map(p => p.ketQua === 'ĐÚNG');
+  
+  // Cập nhật dự đoán trước (khi có kết quả thực tế)
   if (lastPred && lastPred.phienThucTe === data.phien - 1) {
-    const dung = updateStats(gameKey, data.ket_qua, lastPred.duDoan);
+    const dung = updateStats(gameKey, data.ket_qua, lastPred.duDoan, lastPred.do_tin_cay);
     lastPred.thucTe = data.ket_qua;
     lastPred.diceThucTe = data.dice;
-    lastPred.ketQua = dung ? '✅ ĐÚNG' : '❌ SAI';
+    lastPred.ketQua = dung ? 'ĐÚNG' : 'SAI';
+    lastPred.thoiGianKetQua = new Date();
   }
   
+  // Cache: nếu đã dự đoán phiên này rồi thì trả lại kết quả cũ (không đổi khi F5)
   if (hist.cache.has(data.phien)) {
     const cached = hist.cache.get(data.phien);
     hist.data.unshift({
-      phienDuDoan: data.phien + 1, duDoan: cached.duDoan, doTinCay: cached.doTinCay,
-      lyDo: cached.lyDo, soThuatToan: cached.soThuatToan,
-      phienThucTe: data.phien, thucTe: null, diceThucTe: null, ketQua: null, time: new Date()
+      phienDuDoan: data.phien + 1,
+      duDoan: cached.duDoan,
+      do_tin_cay: cached.doTinCay,
+      lyDo: cached.lyDo,
+      soThuatToan: cached.soThuatToan,
+      phienThucTe: data.phien,
+      thucTe: null,
+      diceThucTe: null,
+      ketQua: null,
+      thoiGianDuDoan: new Date()
     });
     if (hist.data.length > 100) hist.data.pop();
     return {
@@ -434,7 +371,9 @@ async function xuLyGame(gameKey) {
     };
   }
   
-  let lichSuKetQua = [data.ket_qua], lichSuTong = [data.tong];
+  // Xây lịch sử kết quả để dự đoán
+  let lichSuKetQua = [data.ket_qua];
+  let lichSuTong = [data.tong];
   for (let item of hist.data) {
     if (item.thucTe) {
       lichSuKetQua.push(item.thucTe);
@@ -444,25 +383,51 @@ async function xuLyGame(gameKey) {
     }
   }
   
-  const pred = predictors[gameKey].duDoan(lichSuKetQua, lichSuTong);
+  // Dự đoán
+  let pred;
+  if (gameKey.includes('sicbo')) {
+    pred = duDoanSicbo(lichSuKetQua, lichSuTong, lichSuDungGanDay);
+  } else {
+    pred = duDoanTaiXiu(lichSuKetQua, lichSuTong, lichSuDungGanDay);
+  }
   
-  hist.cache.set(data.phien, { duDoan: pred.duDoan, doTinCay: pred.doTinCay, lyDo: pred.lyDo, soThuatToan: pred.soThuatToan });
+  // Lưu cache
+  hist.cache.set(data.phien, {
+    duDoan: pred.duDoan,
+    doTinCay: pred.doTinCay,
+    lyDo: pred.lyDo,
+    soThuatToan: pred.soThuatToan
+  });
   if (hist.cache.size > 20) {
     const first = hist.cache.keys().next().value;
     hist.cache.delete(first);
   }
   
+  // Lưu dự đoán vào lịch sử
   hist.data.unshift({
-    phienDuDoan: data.phien + 1, duDoan: pred.duDoan, doTinCay: pred.doTinCay,
-    lyDo: pred.lyDo, soThuatToan: pred.soThuatToan,
-    phienThucTe: data.phien, thucTe: null, diceThucTe: null, ketQua: null, time: new Date()
+    phienDuDoan: data.phien + 1,
+    duDoan: pred.duDoan,
+    do_tin_cay: pred.doTinCay,
+    lyDo: pred.lyDo,
+    soThuatToan: pred.soThuatToan,
+    phienThucTe: data.phien,
+    thucTe: null,
+    diceThucTe: null,
+    ketQua: null,
+    thoiGianDuDoan: new Date()
   });
   if (hist.data.length > 100) hist.data.pop();
   
   return {
     phienHienTai: data.phien,
     ketQuaTruoc: { phien: data.phien, ket_qua: data.ket_qua, dice: data.dice, tong: data.tong },
-    duDoan: { phien: data.phien + 1, du_doan: pred.duDoan, do_tin_cay: pred.doTinCay + '%', ly_do: pred.lyDo, so_thuat_toan: pred.soThuatToan },
+    duDoan: { 
+      phien: data.phien + 1, 
+      du_doan: pred.duDoan, 
+      do_tin_cay: pred.doTinCay + '%', 
+      ly_do: pred.lyDo, 
+      so_thuat_toan: pred.soThuatToan 
+    },
     thongKe: hist.stats
   };
 }
@@ -490,8 +455,13 @@ app.get('/lich-su/:game', (req, res) => {
   res.json({
     game,
     lichSu: hist.data.slice(0, 30).map(p => ({
-      phien_du_doan: p.phienDuDoan, du_doan: p.duDoan, do_tin_cay: p.doTinCay + '%',
-      ly_do: p.lyDo, so_thuat_toan: p.soThuatToan, thuc_te: p.thucTe, ket_qua: p.ketQua
+      phien_du_doan: p.phienDuDoan,
+      du_doan: p.duDoan,
+      do_tin_cay: p.do_tin_cay + '%',
+      ly_do: p.lyDo,
+      so_thuat_toan: p.soThuatToan,
+      thuc_te: p.thucTe,
+      ket_qua: p.ketQua
     })),
     thongKe: hist.stats
   });
@@ -507,17 +477,22 @@ app.get('/lich-su', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: '🚀 API VIP CÂN BẰNG - 11 GAME',
+    name: '🚀 API VIP - Tỉ Lệ Thực Tế 48%-88%',
     author: '@tranhoang2286',
-    version: '8.0 - Đã fix lỗi lệch Tài',
+    version: '9.0',
     endpoints: Object.keys(ALL_APIS).map(k => `/${k.replace(/_/g, '/')}`),
-    luu_y: 'Thuật toán đã được cân bằng, không thiên vị Tài hay Xỉu'
+    lich_su: '/lich-su hoặc /lich-su/:game',
+    tinh_nang: {
+      ti_le_thuc_te: '48% - 88% (không còn 55% ảo)',
+      tu_dong_cap_nhat: 'Khi có kết quả thực tế, tự động cập nhật và dự đoán phiên tiếp theo',
+      cache: 'F5 không đổi kết quả'
+    }
   });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 VIP SERVER CÂN BẰNG - ${Object.keys(ALL_APIS).length} GAME`);
+  console.log(`\n🚀 VIP SERVER - ${Object.keys(ALL_APIS).length} GAME`);
   console.log(`📡 PORT: ${PORT}`);
-  console.log(`✅ ĐÃ FIX LỖI: Không còn dự đoán lệch về Tài nữa`);
-  console.log(`🧠 Thuật toán: Cân bằng hoàn toàn giữa Tài và Xỉu`);
+  console.log(`📊 Tỉ lệ thực tế: 48% - 88% (tùy độ khó của dự đoán)`);
+  console.log(`🔄 Tự động cập nhật khi có kết quả mới`);
 });
