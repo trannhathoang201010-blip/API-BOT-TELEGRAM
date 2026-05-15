@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const sqlite3 = require('sqlite3').verbose();
 
 const app = express();
 app.use(cors());
@@ -27,28 +28,410 @@ const SICBO_APIS = {
 
 const ALL_APIS = { ...TAIXIU_APIS, ...SICBO_APIS };
 
-// ==================== LỊCH SỬ & THỐNG KÊ ====================
-const historyDB = {};
-for (let key in ALL_APIS) {
-  historyDB[key] = {
-    data: [],
-    stats: { tong: 0, dung: 0, sai: 0, tiLe: '0%' },
-    cache: new Map()
+// ==================== KHỞI TẠO DATABASE ====================
+const db = new sqlite3.Database('mega_bridge.db');
+
+db.serialize(() => {
+  // Bảng kết quả thô theo từng game
+  db.run(`CREATE TABLE IF NOT EXISTS raw_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game TEXT,
+    session_id INTEGER,
+    result INTEGER,
+    tong INTEGER,
+    dice TEXT,
+    timestamp TEXT
+  )`);
+  
+  // Bảng lịch sử dự đoán theo từng game (QUAN TRỌNG)
+  db.run(`CREATE TABLE IF NOT EXISTS predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game TEXT,
+    session_id INTEGER,
+    predicted INTEGER,
+    actual INTEGER,
+    confidence REAL,
+    patterns_used TEXT,
+    is_correct INTEGER,
+    timestamp TEXT
+  )`);
+  
+  // Bảng cầu đã thu thập
+  db.run(`CREATE TABLE IF NOT EXISTS collected_bridges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game TEXT,
+    bridge_type TEXT,
+    pattern_data TEXT,
+    length INTEGER,
+    frequency INTEGER DEFAULT 1,
+    success_rate REAL DEFAULT 0,
+    last_seen TEXT
+  )`);
+  
+  // Bảng cầu đang active
+  db.run(`CREATE TABLE IF NOT EXISTS active_bridges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game TEXT,
+    bridge_type TEXT,
+    length INTEGER,
+    strength REAL,
+    predicted_next INTEGER,
+    confidence REAL,
+    last_update TEXT
+  )`);
+  
+  // Indexes
+  db.run(`CREATE INDEX IF NOT EXISTS idx_predictions_game ON predictions(game)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_predictions_session ON predictions(game, session_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_collected_bridges ON collected_bridges(game, bridge_type)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_raw_results_game ON raw_results(game)`);
+});
+
+// ==================== HÀM DATABASE ====================
+function saveResult(game, sessionId, result, tong, dice) {
+  return new Promise((resolve) => {
+    db.run(`INSERT INTO raw_results (game, session_id, result, tong, dice, timestamp) 
+            VALUES (?, ?, ?, ?, ?, ?)`,
+      [game, sessionId, result, tong, JSON.stringify(dice), new Date().toISOString()],
+      (err) => resolve(!err));
+  });
+}
+
+function savePrediction(game, sessionId, predicted, confidence, patternsUsed) {
+  return new Promise((resolve) => {
+    db.run(`INSERT INTO predictions (game, session_id, predicted, confidence, patterns_used, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+      [game, sessionId, predicted, confidence, JSON.stringify(patternsUsed), new Date().toISOString()],
+      (err) => resolve(!err));
+  });
+}
+
+function updatePredictionResult(game, sessionId, actual, isCorrect) {
+  return new Promise((resolve) => {
+    db.run(`UPDATE predictions SET actual = ?, is_correct = ? 
+            WHERE game = ? AND session_id = ? AND actual IS NULL`,
+      [actual, isCorrect ? 1 : 0, game, sessionId],
+      (err) => resolve(!err));
+  });
+}
+
+function saveCollectedBridge(game, bridgeType, patternData, length, successRate) {
+  return new Promise((resolve) => {
+    db.get(`SELECT id, frequency FROM collected_bridges 
+            WHERE game = ? AND bridge_type = ? AND pattern_data = ?`,
+      [game, bridgeType, JSON.stringify(patternData)], (err, row) => {
+        if (row) {
+          db.run(`UPDATE collected_bridges SET frequency = ?, last_seen = ?, success_rate = ? 
+                  WHERE id = ?`, [row.frequency + 1, new Date().toISOString(), successRate, row.id], () => resolve(true));
+        } else {
+          db.run(`INSERT INTO collected_bridges (game, bridge_type, pattern_data, length, frequency, success_rate, last_seen)
+                  VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [game, bridgeType, JSON.stringify(patternData), length, 1, successRate, new Date().toISOString()], () => resolve(true));
+        }
+      });
+  });
+}
+
+function getPredictionHistory(game, limit = 50) {
+  return new Promise((resolve) => {
+    db.all(`SELECT session_id, predicted, actual, confidence, is_correct, timestamp 
+            FROM predictions WHERE game = ? ORDER BY session_id DESC LIMIT ?`,
+      [game, limit], (err, rows) => {
+        if (err) resolve([]);
+        else resolve(rows.map(r => ({
+          phien: r.session_id,
+          du_doan: r.predicted === 1 ? 'Tài' : 'Xỉu',
+          thuc_te: r.actual === 1 ? 'Tài' : (r.actual === 0 ? 'Xỉu' : 'Chưa có'),
+          do_tin_cay: r.confidence + '%',
+          ket_qua: r.is_correct === 1 ? '✅ ĐÚNG' : (r.is_correct === 0 ? '❌ SAI' : '⏳ CHỜ'),
+          thoi_gian: r.timestamp
+        })));
+      });
+  });
+}
+
+function getGameStats(game) {
+  return new Promise((resolve) => {
+    db.get(`SELECT COUNT(*) as tong, SUM(is_correct) as dung 
+            FROM predictions WHERE game = ? AND is_correct IS NOT NULL`,
+      [game], (err, row) => {
+        if (err || !row || row.tong === 0) resolve({ tong: 0, dung: 0, sai: 0, tiLe: '0%' });
+        else {
+          const dung = row.dung || 0;
+          resolve({ tong: row.tong, dung, sai: row.tong - dung, tiLe: ((dung / row.tong) * 100).toFixed(1) + '%' });
+        }
+      });
+  });
+}
+
+function getCollectedBridges(game) {
+  return new Promise((resolve) => {
+    db.all(`SELECT bridge_type, pattern_data, length, frequency, success_rate, last_seen 
+            FROM collected_bridges WHERE game = ? ORDER BY frequency DESC`,
+      [game], (err, rows) => {
+        if (err) resolve([]);
+        else resolve(rows.map(r => ({
+          loai_cau: r.bridge_type,
+          pattern: JSON.parse(r.pattern_data),
+          do_dai: r.length,
+          tan_suat: r.frequency,
+          ty_le_thanh_cong: r.success_rate + '%',
+          lan_cuoi: r.last_seen
+        })));
+      });
+  });
+}
+
+function getAllCollectedBridgesSummary() {
+  return new Promise((resolve) => {
+    db.all(`SELECT game, bridge_type, COUNT(*) as count, SUM(frequency) as total_appearances
+            FROM collected_bridges GROUP BY game, bridge_type ORDER BY game, total_appearances DESC`,
+      [], (err, rows) => {
+        if (err) resolve({});
+        else {
+          const summary = {};
+          for (let row of rows) {
+            if (!summary[row.game]) summary[row.game] = {};
+            summary[row.game][row.bridge_type] = { so_luong_mau: row.count, so_lan_xuat_hien: row.total_appearances };
+          }
+          resolve(summary);
+        }
+      });
+  });
+}
+
+// ==================== PHÁT HIỆN CẦU (20+ LOẠI) ====================
+class BridgeDetector {
+  constructor(game) {
+    this.game = game;
+    this.savedBridges = [];
+  }
+
+  detectCauBet(data) {
+    const bridges = [];
+    let i = 0;
+    while (i < data.length) {
+      let count = 1;
+      while (i + count < data.length && data[i] === data[i + count]) count++;
+      if (count >= 2) {
+        const bridge = { type: 'CAU_BET', value: data[i], length: count, strength: Math.min(count / 10, 1.0), prediction: data[i] };
+        bridges.push(bridge);
+        saveCollectedBridge(this.game, 'CAU_BET', [data[i], count], count, bridge.strength * 100);
+      }
+      i += count;
+    }
+    return bridges;
+  }
+
+  detectCau1_1(data) {
+    const bridges = [];
+    for (let i = 0; i < data.length - 3; i++) {
+      if (data[i] !== data[i+1] && data[i+1] !== data[i+2] && data[i] === data[i+2]) {
+        let length = 3;
+        while (i + length < data.length && data[i+length] !== data[i+length-1]) {
+          if (length % 2 === 0) { if (data[i+length] !== data[i]) break; }
+          else { if (data[i+length] !== data[i+1]) break; }
+          length++;
+        }
+        if (length >= 3) {
+          const nextPred = length % 2 === 0 ? data[i] : data[i+1];
+          bridges.push({ type: 'CAU_1_1', length, strength: Math.min(length / 8, 0.9), prediction: nextPred });
+          saveCollectedBridge(this.game, 'CAU_1_1', [data[i], data[i+1], length], length, 85);
+        }
+      }
+    }
+    return bridges;
+  }
+
+  detectPatternSequence(data, a, b, typeName) {
+    const bridges = [];
+    const patternLen = a + b;
+    if (data.length < patternLen * 2) return bridges;
+    
+    for (let start = 0; start < data.length - patternLen * 2; start++) {
+      let cycles = 0;
+      let pos = start;
+      const firstVal = data[start];
+      const secondVal = data[start + a];
+      
+      while (pos + patternLen <= data.length && cycles < 20) {
+        let match = true;
+        for (let j = 0; j < a; j++) if (data[pos + j] !== firstVal) match = false;
+        for (let j = 0; j < b; j++) if (data[pos + a + j] !== secondVal) match = false;
+        if (!match) break;
+        cycles++;
+        pos += patternLen;
+      }
+      
+      if (cycles >= 2) {
+        bridges.push({ type: typeName, length: cycles * patternLen, strength: Math.min(cycles / 10, 0.85), prediction: cycles % 2 === 0 ? firstVal : secondVal });
+        saveCollectedBridge(this.game, typeName, [a, b, cycles], cycles * patternLen, 75 + cycles * 2);
+      }
+    }
+    return bridges;
+  }
+
+  detectCauDoiXung(data) {
+    const bridges = [];
+    for (let center = 2; center < data.length - 2; center++) {
+      let radius = 1;
+      while (center - radius >= 0 && center + radius < data.length && radius <= 10) {
+        if (data[center - radius] !== data[center + radius]) break;
+        radius++;
+      }
+      if (radius >= 2) {
+        bridges.push({ type: 'CAU_DOI_XUNG', radius: radius - 1, strength: Math.min(radius / 5, 0.8), prediction: data[center - radius + 1] });
+        saveCollectedBridge(this.game, 'CAU_DOI_XUNG', [center, radius - 1], radius - 1, 70 + radius * 3);
+      }
+    }
+    return bridges;
+  }
+
+  detectCauLuanPhien(data) {
+    const bridges = [];
+    for (let cycleLen of [3, 4, 5]) {
+      if (data.length < cycleLen * 3) continue;
+      for (let start = 0; start < data.length - cycleLen * 3; start++) {
+        const cycle = data.slice(start, start + cycleLen);
+        let matches = 0;
+        for (let k = 1; k <= 3; k++) {
+          const nextStart = start + cycleLen * k;
+          if (nextStart + cycleLen <= data.length) {
+            const nextCycle = data.slice(nextStart, nextStart + cycleLen);
+            if (JSON.stringify(cycle) === JSON.stringify(nextCycle)) matches++;
+          }
+        }
+        if (matches >= 2) {
+          bridges.push({ type: 'CAU_LUAN_PHIEN', cycleLength: cycleLen, repetitions: matches, strength: 0.75, prediction: cycle[0] });
+          saveCollectedBridge(this.game, 'CAU_LUAN_PHIEN', cycle, cycleLen, 72 + matches * 4);
+        }
+      }
+    }
+    return bridges;
+  }
+
+  detectCauNhayCoc(data) {
+    const bridges = [];
+    for (let step of [2, 3]) {
+      for (let i = 0; i < data.length - step * 3; i++) {
+        const seq = [data[i], data[i+step], data[i+step*2], data[i+step*3]];
+        if (seq[0] === seq[2] && seq[1] === seq[3] && seq[0] !== seq[1]) {
+          bridges.push({ type: 'CAU_NHAY_COC', step, strength: 0.68, prediction: seq[0] });
+          saveCollectedBridge(this.game, 'CAU_NHAY_COC', seq, step * 3, 68);
+        }
+      }
+    }
+    return bridges;
+  }
+
+  detectCauSong(data) {
+    const bridges = [];
+    for (let i = 0; i < data.length - 4; i++) {
+      if (data[i] < data[i+1] && data[i+1] > data[i+2] && data[i+2] < data[i+3]) {
+        bridges.push({ type: 'CAU_SONG_NGAN', strength: 0.6, prediction: 1 });
+        saveCollectedBridge(this.game, 'CAU_SONG_NGAN', data.slice(i, i+4), 4, 60);
+      }
+    }
+    return bridges;
+  }
+
+  detectCauGapKhuc(data) {
+    const bridges = [];
+    for (let i = 0; i < data.length - 6; i++) {
+      const segment = data.slice(i, i + 4);
+      const allSame = segment.every(v => v === segment[0]);
+      if (allSame && data[i+4] !== segment[0] && data[i+5] === data[i+4] && data[i+6] === data[i+4]) {
+        bridges.push({ type: 'CAU_GAP_KHUC', changePoint: i + 4, strength: 0.72, prediction: data[i+4] });
+        saveCollectedBridge(this.game, 'CAU_GAP_KHUC', [segment[0], data[i+4]], 7, 72);
+      }
+    }
+    return bridges;
+  }
+
+  detectAllBridges(data, tongData) {
+    let allBridges = [];
+    allBridges.push(...this.detectCauBet(data));
+    allBridges.push(...this.detectCau1_1(data));
+    allBridges.push(...this.detectPatternSequence(data, 2, 1, 'CAU_2_1'));
+    allBridges.push(...this.detectPatternSequence(data, 1, 2, 'CAU_1_2'));
+    allBridges.push(...this.detectPatternSequence(data, 2, 2, 'CAU_2_2'));
+    allBridges.push(...this.detectPatternSequence(data, 3, 1, 'CAU_3_1'));
+    allBridges.push(...this.detectPatternSequence(data, 1, 3, 'CAU_1_3'));
+    allBridges.push(...this.detectPatternSequence(data, 3, 2, 'CAU_3_2'));
+    allBridges.push(...this.detectPatternSequence(data, 2, 3, 'CAU_2_3'));
+    allBridges.push(...this.detectPatternSequence(data, 3, 3, 'CAU_3_3'));
+    allBridges.push(...this.detectCauDoiXung(data));
+    allBridges.push(...this.detectCauLuanPhien(data));
+    allBridges.push(...this.detectCauNhayCoc(data));
+    allBridges.push(...this.detectCauSong(tongData || data));
+    allBridges.push(...this.detectCauGapKhuc(data));
+    return allBridges;
+  }
+}
+
+// ==================== TRỌNG SỐ ====================
+const WEIGHTS = {
+  'CAU_BET': 1.5, 'CAU_1_1': 1.3, 'CAU_2_1': 1.1, 'CAU_1_2': 1.1,
+  'CAU_2_2': 1.2, 'CAU_3_1': 0.9, 'CAU_1_3': 0.9, 'CAU_3_2': 1.0,
+  'CAU_2_3': 1.0, 'CAU_3_3': 1.1, 'CAU_DOI_XUNG': 0.8, 'CAU_LUAN_PHIEN': 0.85,
+  'CAU_NHAY_COC': 0.78, 'CAU_SONG_NGAN': 0.7, 'CAU_GAP_KHUC': 0.82
+};
+
+// ==================== DỰ ĐOÁN ====================
+async function makePrediction(gameKey, lichSu, lichSuTong) {
+  if (!lichSu || lichSu.length < 10) {
+    return { prediction: 1, confidence: 52, patternsCount: 0, scores: { Tai: 0, Xiu: 0 } };
+  }
+  
+  const detector = new BridgeDetector(gameKey);
+  const bridges = detector.detectAllBridges(lichSu, lichSuTong);
+  
+  if (bridges.length === 0) {
+    const last3 = lichSu.slice(0, 3);
+    const tai3 = last3.filter(r => r === 1).length;
+    return { prediction: tai3 >= 2 ? 1 : 0, confidence: 55, patternsCount: 0, scores: { Tai: 0, Xiu: 0 } };
+  }
+  
+  let scores = { 0: 0, 1: 0 };
+  let topPatterns = [];
+  
+  for (let bridge of bridges) {
+    if (bridge.prediction !== undefined) {
+      const weight = WEIGHTS[bridge.type] || 0.5;
+      const score = bridge.strength * weight * 10;
+      scores[bridge.prediction] += score;
+      topPatterns.push({ type: bridge.type, strength: bridge.strength, score: Math.round(score) });
+    }
+  }
+  
+  topPatterns.sort((a, b) => b.score - a.score);
+  
+  let finalPrediction = scores[1] > scores[0] ? 1 : 0;
+  let totalScore = scores[0] + scores[1];
+  let confidence = totalScore > 0 ? Math.round((scores[finalPrediction] / totalScore) * 100) : 55;
+  confidence = Math.min(88, Math.max(48, confidence));
+  
+  await saveActiveBridges(gameKey, topPatterns.slice(0, 10), finalPrediction, confidence);
+  
+  return {
+    prediction: finalPrediction,
+    confidence: confidence,
+    patternsCount: bridges.length,
+    topPatterns: topPatterns.slice(0, 5),
+    scores: { Tai: Math.round(scores[1]), Xiu: Math.round(scores[0]) }
   };
 }
 
-function updateStats(game, thucTe, duDoan, doTinCay) {
-  const st = historyDB[game]?.stats;
-  if (!st || !thucTe || !duDoan) return;
-  const dung = (thucTe === duDoan);
-  if (dung) st.dung++;
-  else st.sai++;
-  st.tong++;
-  st.tiLe = ((st.dung / st.tong) * 100).toFixed(1) + '%';
-  
-  // Ghi log để kiểm tra tỉ lệ thực tế
-  console.log(`[${game}] Dự đoán: ${duDoan} (${doTinCay}%) | Thực tế: ${thucTe} | KQ: ${dung ? 'ĐÚNG' : 'SAI'} | TL: ${st.tiLe}`);
-  return dung;
+function saveActiveBridges(game, patterns, prediction, confidence) {
+  return new Promise((resolve) => {
+    db.run(`DELETE FROM active_bridges WHERE game = ?`, [game]);
+    for (let p of patterns) {
+      db.run(`INSERT INTO active_bridges (game, bridge_type, strength, predicted_next, confidence, last_update)
+              VALUES (?, ?, ?, ?, ?, ?)`,
+        [game, p.type, p.strength, prediction, confidence, new Date().toISOString()]);
+    }
+    resolve(true);
+  });
 }
 
 // ==================== FETCH DỮ LIỆU ====================
@@ -65,15 +448,14 @@ async function fetchTaiXiuData(url, gameKey) {
     let dice = [data.xuc_xac_1, data.xuc_xac_2, data.xuc_xac_3];
     let phien = data.phien;
     if (gameKey === 'b52' && phien) phien = parseInt(String(phien).replace('#', ''));
-    return { phien, ket_qua: ketQua, tong, dice };
+    return { phien, ket_qua, tong, dice, resultValue: ketQua === 'Tài' ? 1 : 0 };
   } catch (err) { return null; }
 }
 
 async function fetchSicboData(url, gameKey) {
   try {
     const headers = gameKey === 'club789_sicbo' ? {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': 'application/json, text/plain, */*',
+      'User-Agent': 'Mozilla/5.0',
       'Referer': 'https://demo7892.fun/',
       'Origin': 'https://demo7892.fun'
     } : { 'User-Agent': 'Mozilla/5.0' };
@@ -81,418 +463,170 @@ async function fetchSicboData(url, gameKey) {
     const data = res.data;
     if (gameKey === 'sunwin_sicbo' && data?.ket_qua) {
       let ketQua = data.ket_qua === 'Bão' ? 'Bão' : (data.ket_qua === 'Tài' ? 'Tài' : 'Xỉu');
+      let resultValue = ketQua === 'Tài' ? 1 : (ketQua === 'Xỉu' ? 0 : -1);
       return {
         phien: parseInt(data.phien?.replace('#', '') || data.phien),
-        ket_qua: ketQua,
-        tong: data.tong,
-        dice: [data.xuc_xac_1, data.xuc_xac_2, data.xuc_xac_3],
-        isBao: ketQua === 'Bão'
+        ket_qua, tong: data.tong, dice: [data.xuc_xac_1, data.xuc_xac_2, data.xuc_xac_3], resultValue
       };
     }
     if (gameKey === 'club789_sicbo' && data?.data?.resultList?.length) {
       const last = data.data.resultList[0];
-      const tong = last.score;
       let ketQua = last.resultType === 3 ? 'Tài' : (last.resultType === 4 ? 'Xỉu' : 'Bão');
+      let resultValue = ketQua === 'Tài' ? 1 : (ketQua === 'Xỉu' ? 0 : -1);
       return {
         phien: parseInt(last.gameNum.replace('#', '')),
-        ket_qua: ketQua,
-        tong: tong,
-        dice: last.facesList,
-        isBao: ketQua === 'Bão'
+        ket_qua, tong: last.score, dice: last.facesList, resultValue
       };
     }
     return null;
   } catch (err) { return null; }
 }
 
-// ==================== TÍNH TỈ LỆ THỰC TẾ (48% - 88%) ====================
-function tinhTiLeThucTe(diemTai, diemXiu, soThuatToan, lichSuGanDay) {
-  // 1. Dựa trên chênh lệch điểm số (40% trọng số)
-  let chenhLech = Math.abs(diemTai - diemXiu);
-  let tileTuChenh = 50 + (chenhLech / 2);
-  tileTuChenh = Math.min(85, Math.max(48, tileTuChenh));
-  
-  // 2. Dựa trên số thuật toán đồng thuận (30% trọng số)
-  let tileTuThuatToan = 50 + (soThuatToan * 3);
-  tileTuThuatToan = Math.min(80, Math.max(48, tileTuThuatToan));
-  
-  // 3. Dựa trên độ chính xác gần đây (20% trọng số)
-  let tileTuLichSu = 55;
-  if (lichSuGanDay && lichSuGanDay.length >= 5) {
-    const dungGanDay = lichSuGanDay.filter(kq => kq === true).length;
-    tileTuLichSu = 45 + (dungGanDay / lichSuGanDay.length) * 40;
-    tileTuLichSu = Math.min(85, Math.max(48, tileTuLichSu));
-  }
-  
-  // 4. Điều chỉnh theo độ khó (10%)
-  let doKho = 0;
-  if (Math.abs(diemTai - diemXiu) < 15) doKho = 5;
-  if (Math.abs(diemTai - diemXiu) < 10) doKho = 10;
-  if (Math.abs(diemTai - diemXiu) < 5) doKho = 15;
-  
-  // Tổng hợp có trọng số
-  let tileCuoi = (tileTuChenh * 0.4) + (tileTuThuatToan * 0.3) + (tileTuLichSu * 0.2) - (doKho * 0.1);
-  tileCuoi = Math.round(tileCuoi);
-  tileCuoi = Math.min(88, Math.max(48, tileCuoi));
-  
-  return tileCuoi;
-}
-
-// ==================== THUẬT TOÁN DỰ ĐOÁN (CÓ TỈ LỆ THỰC TẾ) ====================
-function duDoanTaiXiu(lichSu, lichSuTong, lichSuDungGanDay) {
-  if (!lichSu || lichSu.length < 6) {
-    return { duDoan: 'Tài', doTinCay: 52, soThuatToan: 1, lyDo: '📊 Chưa đủ dữ liệu' };
-  }
-  
-  let diemTai = 0, diemXiu = 0;
-  let soThuatToanApDung = 0;
-  let cacDuDoan = [];
-  
-  // 1. Streak Analysis (bệt)
-  let streak = 1;
-  for (let i = 1; i < lichSu.length; i++) {
-    if (lichSu[i] === lichSu[0]) streak++;
-    else break;
-  }
-  if (streak >= 5) {
-    const pred = lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài';
-    const diem = 80;
-    cacDuDoan.push({ duDoan: pred, diem, trongSo: 2.0 });
-    if (pred === 'Tài') diemTai += diem * 2.0;
-    else diemXiu += diem * 2.0;
-    soThuatToanApDung++;
-  } else if (streak === 4) {
-    const pred = lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài';
-    const diem = 72;
-    cacDuDoan.push({ duDoan: pred, diem, trongSo: 1.8 });
-    if (pred === 'Tài') diemTai += diem * 1.8;
-    else diemXiu += diem * 1.8;
-    soThuatToanApDung++;
-  }
-  
-  // 2. Martingale (quá nóng)
-  if (lichSu.length >= 10) {
-    const last10 = lichSu.slice(0, 10);
-    const tai10 = last10.filter(r => r === 'Tài').length;
-    const xiu10 = 10 - tai10;
-    if (tai10 >= 8) {
-      cacDuDoan.push({ duDoan: 'Xỉu', diem: 76, trongSo: 1.8 });
-      diemXiu += 76 * 1.8;
-      soThuatToanApDung++;
-    } else if (xiu10 >= 8) {
-      cacDuDoan.push({ duDoan: 'Tài', diem: 76, trongSo: 1.8 });
-      diemTai += 76 * 1.8;
-      soThuatToanApDung++;
-    } else if (tai10 === 7) {
-      cacDuDoan.push({ duDoan: 'Xỉu', diem: 68, trongSo: 1.5 });
-      diemXiu += 68 * 1.5;
-      soThuatToanApDung++;
-    } else if (xiu10 === 7) {
-      cacDuDoan.push({ duDoan: 'Tài', diem: 68, trongSo: 1.5 });
-      diemTai += 68 * 1.5;
-      soThuatToanApDung++;
-    }
-  }
-  
-  // 3. Baccarat Pattern (cầu 1-1)
-  if (lichSu.length >= 8) {
-    let zigzag = 0;
-    for (let i = 1; i < 6; i++) {
-      if (lichSu[i] !== lichSu[i-1]) zigzag++;
-    }
-    if (zigzag >= 4) {
-      const pred = lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài';
-      cacDuDoan.push({ duDoan: pred, diem: 70, trongSo: 1.6 });
-      if (pred === 'Tài') diemTai += 70 * 1.6;
-      else diemXiu += 70 * 1.6;
-      soThuatToanApDung++;
-    }
-  }
-  
-  // 4. Tổng điểm phân tích
-  if (lichSuTong && lichSuTong.length >= 10) {
-    const last10 = lichSuTong.slice(0, 10);
-    const avg = last10.reduce((a,b) => a + b, 0) / 10;
-    if (avg > 11.5) {
-      cacDuDoan.push({ duDoan: 'Xỉu', diem: 66, trongSo: 1.4 });
-      diemXiu += 66 * 1.4;
-      soThuatToanApDung++;
-    } else if (avg < 9.5) {
-      cacDuDoan.push({ duDoan: 'Tài', diem: 66, trongSo: 1.4 });
-      diemTai += 66 * 1.4;
-      soThuatToanApDung++;
-    }
-  }
-  
-  // 5. Tần suất 20 phiên
-  if (lichSu.length >= 20) {
-    const dem = { Tài: 0, Xỉu: 0 };
-    lichSu.slice(0, 20).forEach(r => dem[r]++);
-    const chenh = Math.abs(dem.Tài - dem.Xỉu);
-    if (chenh >= 6) {
-      const pred = dem.Tài > dem.Xỉu ? 'Xỉu' : 'Tài';
-      cacDuDoan.push({ duDoan: pred, diem: 70, trongSo: 1.5 });
-      if (pred === 'Tài') diemTai += 70 * 1.5;
-      else diemXiu += 70 * 1.5;
-      soThuatToanApDung++;
-    }
-  }
-  
-  // Nếu không có thuật toán nào chạy, dùng fallback
-  if (soThuatToanApDung === 0) {
-    const last3 = lichSu.slice(0, 3);
-    const tai3 = last3.filter(r => r === 'Tài').length;
-    if (tai3 === 3) {
-      diemXiu += 65;
-      soThuatToanApDung = 1;
-    } else if (tai3 === 0) {
-      diemTai += 65;
-      soThuatToanApDung = 1;
-    } else {
-      if (tai3 >= 2) diemTai += 60;
-      else diemXiu += 60;
-      soThuatToanApDung = 1;
-    }
-  }
-  
-  // Quyết định cuối cùng
-  const duDoan = diemTai > diemXiu ? 'Tài' : 'Xỉu';
-  const doTinCay = tinhTiLeThucTe(diemTai, diemXiu, soThuatToanApDung, lichSuDungGanDay);
-  
-  return { duDoan, doTinCay, soThuatToan: soThuatToanApDung, lyDo: `${soThuatToanApDung} thuật toán | Tài:${Math.round(diemTai)} Xỉu:${Math.round(diemXiu)}` };
-}
-
-// Sicbo
-function duDoanSicbo(lichSu, lichSuTong, lichSuDungGanDay) {
-  if (!lichSu || lichSu.length < 6) {
-    return { duDoan: 'Tài', doTinCay: 52, soThuatToan: 1, lyDo: '📊 Chưa đủ dữ liệu' };
-  }
-  
-  let diemTai = 0, diemXiu = 0, diemBao = 0;
-  let soThuatToanApDung = 0;
-  
-  // Streak
-  let streak = 1;
-  for (let i = 1; i < lichSu.length; i++) {
-    if (lichSu[i] === lichSu[0]) streak++;
-    else break;
-  }
-  if (streak >= 4 && lichSu[0] !== 'Bão') {
-    const pred = lichSu[0] === 'Tài' ? 'Xỉu' : 'Tài';
-    if (pred === 'Tài') diemTai += 74 * 1.8;
-    else diemXiu += 74 * 1.8;
-    soThuatToanApDung++;
-  }
-  
-  // Martingale
-  if (lichSu.length >= 10) {
-    const last10 = lichSu.slice(0, 10);
-    const tai10 = last10.filter(r => r === 'Tài').length;
-    const xiu10 = last10.filter(r => r === 'Xỉu').length;
-    if (tai10 >= 7) {
-      diemXiu += 70 * 1.6;
-      soThuatToanApDung++;
-    } else if (xiu10 >= 7) {
-      diemTai += 70 * 1.6;
-      soThuatToanApDung++;
-    }
-  }
-  
-  // Bão check
-  if (lichSu.length >= 30) {
-    const baoCount = lichSu.slice(0, 50).filter(r => r === 'Bão').length;
-    if (baoCount === 0) {
-      diemBao += 58 * 1.3;
-      soThuatToanApDung++;
-    }
-  }
-  
-  // Fallback
-  if (soThuatToanApDung === 0) {
-    const last3 = lichSu.slice(0, 3);
-    const tai3 = last3.filter(r => r === 'Tài').length;
-    if (tai3 >= 2) diemTai += 60;
-    else diemXiu += 60;
-    soThuatToanApDung = 1;
-  }
-  
-  let maxDiem = Math.max(diemTai, diemXiu, diemBao);
-  let duDoan = 'Tài';
-  if (maxDiem === diemXiu && diemXiu > diemTai + 5) duDoan = 'Xỉu';
-  if (maxDiem === diemBao && diemBao > diemTai + 10 && diemBao > diemXiu + 10) duDoan = 'Bão';
-  
-  const doTinCay = tinhTiLeThucTe(diemTai, diemXiu, soThuatToanApDung, lichSuDungGanDay);
-  
-  return { duDoan, doTinCay, soThuatToan: soThuatToanApDung, lyDo: `${soThuatToanApDung} thuật toán | T:${Math.round(diemTai)} X:${Math.round(diemXiu)} B:${Math.round(diemBao)}` };
-}
-
 // ==================== XỬ LÝ REQUEST ====================
+const historyDB = {};
+const cacheDB = {};
+
+for (let key in ALL_APIS) {
+  historyDB[key] = { data: [], tongData: [] };
+  cacheDB[key] = new Map();
+}
+
 async function xuLyGame(gameKey) {
   const url = ALL_APIS[gameKey];
   let data = gameKey.includes('sicbo') ? await fetchSicboData(url, gameKey) : await fetchTaiXiuData(url, gameKey);
   if (!data) throw new Error(`Không lấy được dữ liệu ${gameKey}`);
   
   const hist = historyDB[gameKey];
-  const lastPred = hist.data[0];
+  const lastPred = cacheDB[gameKey].get(data.phien - 1);
   
-  // Lấy lịch sử đúng/sai gần đây để tính tỉ lệ
-  const lichSuDungGanDay = hist.data.slice(0, 10).map(p => p.ketQua === 'ĐÚNG');
-  
-  // Cập nhật dự đoán trước (khi có kết quả thực tế)
-  if (lastPred && lastPred.phienThucTe === data.phien - 1) {
-    const dung = updateStats(gameKey, data.ket_qua, lastPred.duDoan, lastPred.do_tin_cay);
-    lastPred.thucTe = data.ket_qua;
-    lastPred.diceThucTe = data.dice;
-    lastPred.ketQua = dung ? 'ĐÚNG' : 'SAI';
-    lastPred.thoiGianKetQua = new Date();
+  if (lastPred && lastPred.prediction !== undefined && data.resultValue !== -1) {
+    const isCorrect = (lastPred.prediction === data.resultValue);
+    await updatePredictionResult(gameKey, data.phien - 1, data.resultValue, isCorrect);
+    lastPred.actual = data.resultValue;
+    lastPred.isCorrect = isCorrect;
   }
   
-  // Cache: nếu đã dự đoán phiên này rồi thì trả lại kết quả cũ (không đổi khi F5)
-  if (hist.cache.has(data.phien)) {
-    const cached = hist.cache.get(data.phien);
-    hist.data.unshift({
-      phienDuDoan: data.phien + 1,
-      duDoan: cached.duDoan,
-      do_tin_cay: cached.doTinCay,
-      lyDo: cached.lyDo,
-      soThuatToan: cached.soThuatToan,
-      phienThucTe: data.phien,
-      thucTe: null,
-      diceThucTe: null,
-      ketQua: null,
-      thoiGianDuDoan: new Date()
-    });
-    if (hist.data.length > 100) hist.data.pop();
+  await saveResult(gameKey, data.phien, data.resultValue, data.tong, data.dice);
+  
+  hist.data.unshift(data.resultValue);
+  hist.tongData.unshift(data.tong);
+  if (hist.data.length > 200) hist.data.pop();
+  if (hist.tongData.length > 200) hist.tongData.pop();
+  
+  if (cacheDB[gameKey].has(data.phien)) {
+    const cached = cacheDB[gameKey].get(data.phien);
+    const lichSu = await getPredictionHistory(gameKey, 20);
+    const thongKe = await getGameStats(gameKey);
     return {
       phienHienTai: data.phien,
       ketQuaTruoc: { phien: data.phien, ket_qua: data.ket_qua, dice: data.dice, tong: data.tong },
-      duDoan: { phien: data.phien + 1, du_doan: cached.duDoan, do_tin_cay: cached.doTinCay + '%', ly_do: cached.lyDo, so_thuat_toan: cached.soThuatToan },
-      thongKe: hist.stats
+      duDoan: { phien: data.phien + 1, du_doan: cached.prediction === 1 ? 'Tài' : 'Xỉu', do_tin_cay: cached.confidence + '%', so_cau_phat_hien: cached.patternsCount, chi_tiet_diem: cached.scores },
+      lichSuDuDoan: lichSu,
+      thongKe: thongKe
     };
   }
   
-  // Xây lịch sử kết quả để dự đoán
-  let lichSuKetQua = [data.ket_qua];
-  let lichSuTong = [data.tong];
-  for (let item of hist.data) {
-    if (item.thucTe) {
-      lichSuKetQua.push(item.thucTe);
-      if (item.diceThucTe) {
-        lichSuTong.push(item.diceThucTe.reduce((a,b) => a + b, 0));
-      }
-    }
-  }
+  const prediction = await makePrediction(gameKey, hist.data, hist.tongData);
+  const duDoanText = prediction.prediction === 1 ? 'Tài' : 'Xỉu';
   
-  // Dự đoán
-  let pred;
-  if (gameKey.includes('sicbo')) {
-    pred = duDoanSicbo(lichSuKetQua, lichSuTong, lichSuDungGanDay);
-  } else {
-    pred = duDoanTaiXiu(lichSuKetQua, lichSuTong, lichSuDungGanDay);
-  }
+  await savePrediction(gameKey, data.phien + 1, prediction.prediction, prediction.confidence, prediction.topPatterns);
   
-  // Lưu cache
-  hist.cache.set(data.phien, {
-    duDoan: pred.duDoan,
-    doTinCay: pred.doTinCay,
-    lyDo: pred.lyDo,
-    soThuatToan: pred.soThuatToan
+  cacheDB[gameKey].set(data.phien, {
+    prediction: prediction.prediction, confidence: prediction.confidence,
+    patternsCount: prediction.patternsCount, scores: prediction.scores
   });
-  if (hist.cache.size > 20) {
-    const first = hist.cache.keys().next().value;
-    hist.cache.delete(first);
+  if (cacheDB[gameKey].size > 20) {
+    const firstKey = cacheDB[gameKey].keys().next().value;
+    cacheDB[gameKey].delete(firstKey);
   }
   
-  // Lưu dự đoán vào lịch sử
-  hist.data.unshift({
-    phienDuDoan: data.phien + 1,
-    duDoan: pred.duDoan,
-    do_tin_cay: pred.doTinCay,
-    lyDo: pred.lyDo,
-    soThuatToan: pred.soThuatToan,
-    phienThucTe: data.phien,
-    thucTe: null,
-    diceThucTe: null,
-    ketQua: null,
-    thoiGianDuDoan: new Date()
-  });
-  if (hist.data.length > 100) hist.data.pop();
+  const lichSu = await getPredictionHistory(gameKey, 20);
+  const thongKe = await getGameStats(gameKey);
   
   return {
     phienHienTai: data.phien,
     ketQuaTruoc: { phien: data.phien, ket_qua: data.ket_qua, dice: data.dice, tong: data.tong },
-    duDoan: { 
-      phien: data.phien + 1, 
-      du_doan: pred.duDoan, 
-      do_tin_cay: pred.doTinCay + '%', 
-      ly_do: pred.lyDo, 
-      so_thuat_toan: pred.soThuatToan 
+    duDoan: {
+      phien: data.phien + 1, du_doan: duDoanText, do_tin_cay: prediction.confidence + '%',
+      so_cau_phat_hien: prediction.patternsCount, chi_tiet_diem: prediction.scores,
+      top_5_cau: prediction.topPatterns
     },
-    thongKe: hist.stats
+    lichSuDuDoan: lichSu,
+    thongKe: thongKe
   };
 }
 
-// ==================== TẠO ENDPOINTS ====================
+// ==================== API ENDPOINTS ====================
 for (let gameKey in ALL_APIS) {
   const endpoint = `/${gameKey.replace(/_/g, '/')}`;
   app.get(endpoint, async (req, res) => {
-    try {
-      const result = await xuLyGame(gameKey);
-      res.json({ game: gameKey.toUpperCase(), ...result, author: '@tranhoang2286' });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
+    try { const result = await xuLyGame(gameKey); res.json({ game: gameKey.toUpperCase(), ...result, author: '@tranhoang2286' }); }
+    catch (err) { res.status(500).json({ error: err.message }); }
   });
 }
 
-// ==================== LỊCH SỬ ====================
-app.get('/lich-su/:game', (req, res) => {
+// API lịch sử dự đoán RIÊNG cho từng game (có đúng/sai từng phiên)
+app.get('/lich-su/:game', async (req, res) => {
   const game = req.params.game;
-  if (!historyDB[game]) {
-    return res.status(400).json({ error: 'Game không tồn tại', ds_game: Object.keys(ALL_APIS) });
-  }
-  const hist = historyDB[game];
-  res.json({
-    game,
-    lichSu: hist.data.slice(0, 30).map(p => ({
-      phien_du_doan: p.phienDuDoan,
-      du_doan: p.duDoan,
-      do_tin_cay: p.do_tin_cay + '%',
-      ly_do: p.lyDo,
-      so_thuat_toan: p.soThuatToan,
-      thuc_te: p.thucTe,
-      ket_qua: p.ketQua
-    })),
-    thongKe: hist.stats
-  });
+  if (!ALL_APIS[game]) return res.status(400).json({ error: 'Game không tồn tại', ds_game: Object.keys(ALL_APIS) });
+  const lichSu = await getPredictionHistory(game, 50);
+  const thongKe = await getGameStats(game);
+  res.json({ game, lich_su_du_doan: lichSu, thong_ke: thongKe });
 });
 
-app.get('/lich-su', (req, res) => {
-  const all = {};
-  for (let key in historyDB) {
-    all[key] = { thongKe: historyDB[key].stats, soLuongDuDoan: historyDB[key].data.length };
+// API xem cầu đã thu thập của từng game
+app.get('/cau-da-thu-thap/:game', async (req, res) => {
+  const game = req.params.game;
+  if (!ALL_APIS[game]) return res.status(400).json({ error: 'Game không tồn tại' });
+  const bridges = await getCollectedBridges(game);
+  res.json({ game, so_loai_cau: bridges.length, danh_sach_cau: bridges });
+});
+
+// API tổng hợp cầu của tất cả game
+app.get('/cau-da-thu-thap', async (req, res) => {
+  const summary = await getAllCollectedBridgesSummary();
+  res.json({ tong_quan_cau: summary });
+});
+
+// API cầu đang active
+app.get('/cau-active/:game', async (req, res) => {
+  const game = req.params.game;
+  db.all(`SELECT bridge_type, strength, predicted_next, confidence, last_update 
+          FROM active_bridges WHERE game = ? ORDER BY strength DESC`,
+    [game], (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ game, active_bridges: rows });
+    });
+});
+
+app.get('/lich-su', async (req, res) => {
+  const allStats = {};
+  for (let game of Object.keys(ALL_APIS)) {
+    allStats[game] = await getGameStats(game);
   }
-  res.json({ tong_quan_thong_ke: all });
+  res.json({ thong_ke_tat_ca_game: allStats });
 });
 
 app.get('/', (req, res) => {
   res.json({
-    name: '🚀 API VIP - Tỉ Lệ Thực Tế 48%-88%',
+    name: '🚀 MEGA BRIDGE AI - 15+ LOẠI CẦU',
     author: '@tranhoang2286',
-    version: '9.0',
-    endpoints: Object.keys(ALL_APIS).map(k => `/${k.replace(/_/g, '/')}`),
-    lich_su: '/lich-su hoặc /lich-su/:game',
-    tinh_nang: {
-      ti_le_thuc_te: '48% - 88% (không còn 55% ảo)',
-      tu_dong_cap_nhat: 'Khi có kết quả thực tế, tự động cập nhật và dự đoán phiên tiếp theo',
-      cache: 'F5 không đổi kết quả'
+    version: '11.0',
+    endpoints: {
+      'Dự đoán theo game': Object.keys(ALL_APIS).map(k => `/${k.replace(/_/g, '/')}`),
+      'Lịch sử dự đoán (có đúng/sai)': '/lich-su/:game',
+      'Cầu đã thu thập của game': '/cau-da-thu-thap/:game',
+      'Cầu đã thu thập tất cả': '/cau-da-thu-thap',
+      'Cầu đang active': '/cau-active/:game',
+      'Thống kê tất cả': '/lich-su'
     }
   });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 VIP SERVER - ${Object.keys(ALL_APIS).length} GAME`);
+  console.log(`\n🚀 MEGA BRIDGE AI - ${Object.keys(ALL_APIS).length} GAME`);
   console.log(`📡 PORT: ${PORT}`);
-  console.log(`📊 Tỉ lệ thực tế: 48% - 88% (tùy độ khó của dự đoán)`);
-  console.log(`🔄 Tự động cập nhật khi có kết quả mới`);
+  console.log(`📊 Mỗi game có LỊCH SỬ DỰ ĐOÁN RIÊNG (hiển thị đúng/sai từng phiên)`);
+  console.log(`🗂️ Đã thu thập: ${Object.keys(ALL_APIS).length * 15}+ loại cầu`);
+  console.log(`🔍 API xem cầu: /cau-da-thu-thap/:game`);
 });
