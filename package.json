@@ -1,13 +1,19 @@
 
 {
-  "name": "mega-bridge-ai",
-  "version": "12.0.0",
+  "name": "taixiu-multi-game",
+  "version": "4.0.0",
+  "description": "17 game Tài Xỉu - Mỗi game thuật toán riêng",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "axios": "^1.6.0",
-    "cors": "^2.8.5",
-    "sqlite3": "^5.1.6"
-  }
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "@tranhoang2286"
 }
