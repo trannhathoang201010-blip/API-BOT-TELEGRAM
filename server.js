@@ -8,7 +8,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 5000;
 
 // ==========================================
-// DANH SÁCH API MỚI (17 GAME)
+// DANH SÁCH API MỚI (16 GAME)
 // ==========================================
 const GAME_APIS = {
   // Tài Xỉu
@@ -24,6 +24,7 @@ const GAME_APIS = {
   'sumvin_md5': 'https://cricket-compressed-list-suppose.trycloudflare.com/api/md5',
   'gb68_thuong': 'https://description-zen-dog-films.trycloudflare.com/api/68/thuong',
   'gb68_md5': 'https://profiles-televisions-sic-stay.trycloudflare.com/api/68/md5',
+  'alo_hitclub_md5': 'https://preference-assuming-picnic-concentration.trycloudflare.com/api/txmd5',
   // Sicbo
   'sunwin_sicbo': 'https://enquiries-indices-navigator-mega.trycloudflare.com/api/sunsicbo',
   'luck8_sicbo40': 'https://qld-incentives-tion-boost.trycloudflare.com/api/sicbo40',
@@ -94,14 +95,12 @@ function thuatToanLC79TX(lichSu, tongData) {
   
   let diemTai = 0, diemXiu = 0;
   
-  // Phân tích tổng điểm
   if (tongData && tongData.length >= 5) {
     const avgTong = tongData.slice(0, 5).reduce((a,b) => a+b, 0) / 5;
     if (avgTong > 11.5) diemXiu += 25;
     else if (avgTong < 9.5) diemTai += 25;
   }
   
-  // Phân tích cầu
   let streak = 1;
   for (let i = 1; i < lichSu.length; i++) {
     if (lichSu[i] === lichSu[i-1]) streak++;
@@ -194,7 +193,6 @@ function thuatToanBetvipMD5(lichSu, tongData) {
   
   let diemTai = 0, diemXiu = 0;
   
-  // Dựa vào tổng điểm chẵn lẻ
   if (tongData && tongData.length >= 5) {
     const last5Tong = tongData.slice(0, 5);
     const chanCount = last5Tong.filter(t => t % 2 === 0).length;
@@ -204,7 +202,6 @@ function thuatToanBetvipMD5(lichSu, tongData) {
     }
   }
   
-  // Streak
   let streak = 1;
   for (let i = 1; i < lichSu.length; i++) {
     if (lichSu[i] === lichSu[i-1]) streak++;
@@ -227,7 +224,6 @@ function thuatToan789Club(lichSu) {
   
   let diemTai = 0, diemXiu = 0;
   
-  // Fibonacci check
   const fibs = [2, 3, 5];
   for (let fib of fibs) {
     if (lichSu.length > fib && lichSu[0] === lichSu[fib]) {
@@ -236,7 +232,6 @@ function thuatToan789Club(lichSu) {
     }
   }
   
-  // 5 phiên gần nhất
   const last5 = lichSu.slice(0, 5);
   const tai5 = last5.filter(r => r === "Tài").length;
   if (tai5 >= 3) diemTai += 25;
@@ -254,7 +249,6 @@ function thuatToanB52(lichSu, diceData) {
   
   let diemTai = 0, diemXiu = 0;
   
-  // Phân tích mặt xúc xắc
   if (diceData && diceData.length >= 5) {
     const faces = [];
     for (let dice of diceData.slice(0, 5)) {
@@ -267,7 +261,6 @@ function thuatToanB52(lichSu, diceData) {
     }
   }
   
-  // Streak
   let streak = 1;
   for (let i = 1; i < lichSu.length; i++) {
     if (lichSu[i] === lichSu[i-1]) streak++;
@@ -306,14 +299,12 @@ function thuatToanLuck8MD5(lichSu, tongData) {
   
   let diemTai = 0, diemXiu = 0;
   
-  // RSI giả lập
   const last14 = lichSu.slice(0, 14);
   const tai14 = last14.filter(r => r === "Tài").length;
   const rsi = (tai14 / 14) * 100;
   if (rsi >= 70) diemXiu += 28;
   if (rsi <= 30) diemTai += 28;
   
-  // MA5/MA10
   const ma5 = lichSu.slice(0, 5).filter(r => r === "Tài").length / 5;
   const ma10 = lichSu.slice(0, 10).filter(r => r === "Tài").length / 10;
   if (ma5 > ma10 + 0.2) diemXiu += 22;
@@ -338,7 +329,6 @@ function thuatToanSumvinMD5(lichSu) {
     return { pred, confidence: 74, reason: "Cầu 1-1 (zigzag)" };
   }
   
-  // Cầu 2-1
   if (lichSu[0] === lichSu[1] && lichSu[3] === lichSu[4] && lichSu[0] !== lichSu[3]) {
     return { pred: lichSu[0], confidence: 72, reason: "Cầu 2-1" };
   }
@@ -381,11 +371,66 @@ function thuatToanGB68MD5(lichSu) {
   return { pred, confidence: 60, reason: "Theo phiên gần nhất" };
 }
 
-// Thuật toán 13: Sunwin Sicbo - Phân tích Bão
+// Thuật toán 13: ALO HITCLUB MD5 - Phân tích xúc xắc & cầu 3-2
+function thuatToanAloHitclubMD5(lichSu, tongData, diceData) {
+  if (lichSu.length < 6) return { pred: "Tài", confidence: 55, reason: "Chưa đủ dữ liệu" };
+  
+  let diemTai = 0, diemXiu = 0;
+  let soThuatToan = 0;
+  
+  // 1. Phân tích mặt xúc xắc
+  if (diceData && diceData.length >= 5) {
+    const faces = [];
+    for (let dice of diceData.slice(0, 5)) {
+      if (dice && dice.length === 3) faces.push(...dice);
+    }
+    if (faces.length >= 10) {
+      const faceCounts = { 1:0, 2:0, 3:0, 4:0, 5:0, 6:0 };
+      for (let f of faces) faceCounts[f]++;
+      const maxFace = Object.keys(faceCounts).reduce((a,b) => faceCounts[a] > faceCounts[b] ? a : b);
+      if (maxFace >= 4) { diemTai += 25; soThuatToan++; }
+      else if (maxFace <= 3) { diemXiu += 25; soThuatToan++; }
+    }
+  }
+  
+  // 2. Cầu 3-2
+  if (lichSu.length >= 8) {
+    const pattern = lichSu.slice(0, 5).join('');
+    if (pattern === 'TàiTàiTàiXỉuXỉu' || pattern === 'XỉuXỉuXỉuTàiTài') {
+      if (pattern[0] === 'T') { diemXiu += 35; soThuatToan++; }
+      else { diemTai += 35; soThuatToan++; }
+    }
+  }
+  
+  // 3. Tổng điểm
+  if (tongData && tongData.length >= 5) {
+    const avgTong = tongData.slice(0, 5).reduce((a,b) => a+b, 0) / 5;
+    if (avgTong > 11.5) { diemXiu += 20; soThuatToan++; }
+    else if (avgTong < 9.5) { diemTai += 20; soThuatToan++; }
+  }
+  
+  // 4. Streak
+  let streak = 1;
+  for (let i = 1; i < lichSu.length; i++) {
+    if (lichSu[i] === lichSu[i-1]) streak++;
+    else break;
+  }
+  if (streak >= 3) {
+    if (lichSu[0] === "Tài") diemXiu += 40;
+    else diemTai += 40;
+    soThuatToan++;
+  }
+  
+  const pred = diemTai > diemXiu ? "Tài" : "Xỉu";
+  let confidence = soThuatToan > 0 ? 55 + Math.min(30, soThuatToan * 4) : 55;
+  confidence = Math.min(86, confidence);
+  return { pred, confidence: Math.round(confidence), reason: `${soThuatToan} thuật toán (Xúc xắc + Cầu + Tổng)` };
+}
+
+// Thuật toán 14: Sunwin Sicbo - Phân tích Bão
 function thuatToanSunwinSicbo(lichSu, diceData) {
   if (lichSu.length < 5) return { pred: "Tài", confidence: 55, reason: "Chưa đủ dữ liệu" };
   
-  // Kiểm tra Bão
   if (diceData && diceData.length >= 1) {
     const lastDice = diceData[0];
     if (lastDice && lastDice[0] === lastDice[1] && lastDice[1] === lastDice[2]) {
@@ -401,7 +446,7 @@ function thuatToanSunwinSicbo(lichSu, diceData) {
   return { pred: tai5 >= 3 ? "Tài" : "Xỉu", confidence: 62, reason: "Theo xu hướng" };
 }
 
-// Thuật toán 14: Luck8 Sicbo 40s - Phân tích nhanh
+// Thuật toán 15: Luck8 Sicbo 40s - Phân tích nhanh
 function thuatToanLuck8Sicbo(lichSu) {
   if (lichSu.length < 4) return { pred: "Tài", confidence: 55, reason: "Chưa đủ dữ liệu" };
   
@@ -417,7 +462,7 @@ function thuatToanLuck8Sicbo(lichSu) {
   return { pred: "Tài", confidence: 58, reason: "Mặc định Tài" };
 }
 
-// Thuật toán 15: LC79 Xóc Đĩa - Chẵn/Lẻ
+// Thuật toán 16: LC79 Xóc Đĩa - Chẵn/Lẻ
 function thuatToanXocDia(lichSu) {
   if (lichSu.length < 5) return { pred: "Chẵn", confidence: 55, reason: "Chưa đủ dữ liệu" };
   
@@ -523,6 +568,7 @@ function getAlgorithm(gameKey) {
     'sumvin_md5': thuatToanSumvinMD5,
     'gb68_thuong': thuatToanGB68Thuong,
     'gb68_md5': thuatToanGB68MD5,
+    'alo_hitclub_md5': thuatToanAloHitclubMD5,
     'sunwin_sicbo': thuatToanSunwinSicbo,
     'luck8_sicbo40': thuatToanLuck8Sicbo,
     'lc79_xocdia': thuatToanXocDia
@@ -615,7 +661,7 @@ for (let gameKey in GAME_APIS) {
   app.get(endpoint, async (req, res) => {
     try {
       const result = await xuLyGame(gameKey);
-      res.json({ game: gameKey.toUpperCase(), ...result, author: '@tranhoang2286', date: '17/05/2026' });
+      res.json({ game: gameKey.toUpperCase(), ...result, author: '@tranhoang2286', date: '18/05/2026' });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -651,9 +697,9 @@ app.get('/lich-su', (req, res) => {
 // ==========================================
 app.get('/', (req, res) => {
   res.json({
-    name: '🚀 17 GAME TÀI XỈU - MỖI GAME THUẬT TOÁN RIÊNG',
+    name: '🚀 16 GAME TÀI XỈU - MỖI GAME THUẬT TOÁN RIÊNG',
     author: '@tranhoang2286',
-    version: '4.0 - 17/05/2026',
+    version: '5.0 - 18/05/2026',
     danh_sach_game: Object.keys(GAME_APIS).map(k => `/${k.replace(/_/g, '/')}`),
     thong_ke: '/lich-su',
     huong_dan: 'Gọi /tên-game để nhận dự đoán. Mỗi game có thuật toán phân tích riêng biệt.'
@@ -661,8 +707,8 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 17 GAME TÀI XỈU - ${PORT}`);
+  console.log(`\n🚀 16 GAME TÀI XỈU - ${PORT}`);
   console.log(`📡 Mỗi game có thuật toán riêng biệt`);
   console.log(`🎲 Game list: ${Object.keys(GAME_APIS).join(', ')}`);
-  console.log(`📅 Cập nhật: 17/05/2026`);
+  console.log(`📅 Cập nhật: 18/05/2026`);
 });
